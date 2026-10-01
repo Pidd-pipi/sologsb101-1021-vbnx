@@ -19,6 +19,8 @@ export type NewRecord<T extends IdbRecord> = Omit<T, 'id' | 'createdAt' | 'updat
 export interface UseIdbTableOptions {
   /** 是否按 updatedAt 倒序，默认 true */
   sortByUpdatedAt?: boolean;
+  /** 是否包含撤回（软删除）行，默认 false：业务列表不显示已撤回记录 */
+  includeWithdrawn?: boolean;
 }
 
 export interface UseIdbTableResult<T extends IdbRecord> {
@@ -45,7 +47,7 @@ export function useIdbTable<T extends IdbRecord>(
   tableSelector: (database: typeof db) => Table<T, string>,
   options: UseIdbTableOptions = {},
 ): UseIdbTableResult<T> {
-  const { sortByUpdatedAt = true } = options;
+  const { sortByUpdatedAt = true, includeWithdrawn = false } = options;
   const table = tableSelector(db);
 
   const rows = writable<T[]>([]);
@@ -53,8 +55,12 @@ export function useIdbTable<T extends IdbRecord>(
   const ready = writable(false);
   const error = writable('');
 
-  const applySort = (list: T[]): T[] =>
-    sortByUpdatedAt ? [...list].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)) : [...list];
+  const applySort = (list: T[]): T[] => {
+    const visible = includeWithdrawn ? list : list.filter((row) => (row as IdbRecord & { withdrawn?: boolean }).withdrawn !== true);
+    return sortByUpdatedAt
+      ? [...visible].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+      : [...visible];
+  };
 
   const refresh = async (): Promise<void> => {
     loading.set(true);

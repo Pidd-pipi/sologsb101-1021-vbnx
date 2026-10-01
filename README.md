@@ -70,8 +70,9 @@ npm run preview    # 本地预览构建产物（http://localhost:22821）
 | `/#/stones` | 印石台账 | 新建印石、按石种与钮式筛选（同步 URL query），显示已刻方数、谱录方数与闲置天数 | Stone、Design |
 | `/#/designs` | 印稿设计与释文 | 朱文白文、边框式样与章法备注录入，标记采用稿（同石采用稿唯一） | Design、Stone |
 | `/#/carve` | 刻制工序看板 | 按印稿列出刀法步骤、拖拽或上下移排序、批量完成；全部完成回写印石为「已刻」 | Carve、Design |
-| `/#/impressions` | 钤印登记与效果比对 | 同稿多枚并列展示印泥、纸张、压力与评级，按评级择优并一键回填采用稿效果 | Impression、Design |
+| `/#/impressions` | 钤印登记与效果比对 | 同稿多枚并列展示印泥、纸张、压力与评级，按评级择优并一键回填采用稿效果；支持撤回（软删除，随交接同步） | Impression、Design |
 | `/#/catalog` | 印谱汇总与导出 | 排序重编号、收录状态切换、印谱清单生成、JSON 导入导出与清空重播种 | Catalog 及全部模型 |
+| `/#/handoff` | 离线交接 | 各机一批导出交接包；导入先列新增/修改/撤回/冲突，冲突裁决后事务化合并生效；失败可恢复 | 全部模型 + kvmeta |
 
 未知路径由 `routes/NotFound.svelte` 给出友好空态（不白屏）。筛选条件写入 hash query（`?kw=&stoneType=&knobStyle=` 等），刷新后可完整还原。
 
@@ -87,7 +88,21 @@ npm run preview    # 本地预览构建产物（http://localhost:22821）
 | Impression 钤印记录 | `src/lib/types/impression.ts` | `id` `designId` `inkBrand` `paperType`（连史纸/宣纸/罗纹纸） `pressure`（轻/中/重） `grade`（优/良/一般/废） `stampedAt` | 同稿多次钤印按评级排序择优，可一键回填采用稿效果 |
 | Catalog 印谱条目 | `src/lib/types/catalog.ts` | `id` `stoneId` `designId` `orderNo` `included`（待收录/已收录/不收录） `note` | 调整排序后自动重编号并汇总已收录方数 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/lib/utils/db.ts`，当前为 `v2`：`v1` 为初版五表结构；`v2` 补充 `stones.purchaseDate`、`designs.borderStyle`、`carves.operator`、`impressions.paperType`、`catalogs.included` 等索引，并在 Dexie `.upgrade()` 中回填历史记录缺失字段（`grade`、`adopted`、`borderStyle`、`orderNo`、`included`、`note`）。
+数据结构版本号 `DB_VERSION` 定义在 `src/lib/utils/db.ts`，当前为 `v3`：`v1` 为初版五表结构；`v2` 补充 `stones.purchaseDate`、`designs.borderStyle`、`carves.operator`、`impressions.paperType`、`catalogs.included` 等索引，并在 Dexie `.upgrade()` 中回填历史记录缺失字段（`grade`、`adopted`、`borderStyle`、`orderNo`、`included`、`note`）；`v3` 增加**离线交接**能力——五张业务表统一补充 `batchId`（所属批次）、`withdrawn` / `withdrawnAt`（软删除撤回标记）字段与索引，并新增 `kvmeta` 键值表保存活动批次基线、已应用批次与导入回滚点。旧版数据打开时由 `.upgrade()` 自动迁移：历史行补入 `legacy` 批次并补撤回标记；旧版整库 JSON 备份走 `/catalog` 导入时也会自动补批次（`imported-full`）与撤回标记。
+
+### 离线交接（多机会场协作）
+
+无网会场多台笔记本各自补刻制工序、换采用稿、登记钤印，回社后通过 `/handoff` 页做**增量三方合并**（基线 base / 本机 local / 对方 incoming），不再整份覆盖：
+
+- **各机一批**：首次打开自动以当前全量为基线建批（`ensureActiveBatch`）；交接包只携带本批改动行及其基线旧值，合并不依赖各机时钟一致。
+- **先审后合**：导入交接包先分区列出「新增 / 修改 / 撤回 / 冲突」，确认后在**单个 Dexie 事务**内一起生效。
+- **工序双改**：同一印稿两边都改过工序时，两边记录全部保留（对方同 id 工序复制为确定性新 id），统一按**刀法时长升序**（同长按创建时间）重排并重编号。
+- **印石信息冲突**：两边都改同一印石时进入人工**裁决**，逐项选「保留本机 / 采用对方」，未裁决不能生效；印稿/印谱条目双改默认按更新时间建议，可改选。
+- **钤印重复**：同一印稿 + 同一钤印日期 + 同一纸张（印泥相同）视为重复按压，按评级保留较优一枚，评级相同取更新较晚者，其余软删除撤回。
+- **撤回**：撤回为软删除（`withdrawn`），跨机同步；本机已改而对方撤回时进入冲突由人裁决。
+- **失败恢复**：合并 / 覆盖导入前自动把当前全量存入 `kvmeta` 回滚点；事务失败整体回滚并自动恢复，也可在 `/handoff`、`/catalog` 手动「恢复到导入前」。
+- **批次防重**：同一批次包只应用一次（`applied-batches`）。
+- **跨标签页保护**：另一个标签页保存时，本页顶部先提示「数据已在别处更新，请刷新」，确认后统一重载；合并完成后全局重算印谱顺序（`renumberCatalog`）。
 
 ---
 
@@ -101,11 +116,12 @@ sologsb101-1021/
 │   │   │   ├── types/            # stone.ts design.ts carve.ts impression.ts catalog.ts
 │   │   │   ├── stores/           # stoneStore.ts designStore.ts carveStore.ts impressionStore.ts
 │   │   │   ├── components/common/# GradeTag.svelte FilterBar.svelte StatBadge.svelte EmptyPanel.svelte
+│   │   │   ├── components/handoff/# ConflictList.svelte MergeReview.svelte（交接冲突裁决与合并预览）
 │   │   │   ├── hooks/            # useCarveProgress.ts useIdbTable.ts
-│   │   │   ├── utils/            # stone.ts db.ts export.ts
+│   │   │   ├── utils/            # stone.ts db.ts export.ts sync.ts（交接三方合并纯逻辑）handoff.ts（批次/IO/回滚）handoffView.ts
 │   │   │   └── router/           # index.ts（路由表 + 导航项）
 │   │   ├── routes/               # stones/+page.svelte designs/+page.svelte carve/+page.svelte
-│   │   │                         # impressions/+page.svelte catalog/+page.svelte NotFound.svelte
+│   │   │                         # impressions/+page.svelte catalog/+page.svelte handoff/+page.svelte NotFound.svelte
 │   │   ├── App.svelte            # 应用外壳（导航 + 首屏初始化）
 │   │   ├── main.js main.ts       # 入口：main.js 引用 main.ts 的 bootstrap()
 │   │   └── app.css               # Tailwind 入口 + 基础层 / 组件层
@@ -127,9 +143,9 @@ sologsb101-1021/
 
 ## 七、数据存储说明
 
-- **IndexedDB（Dexie，数据库名 `gbsealcarve`）**：5 张业务表 `stones` / `designs` / `carves` / `impressions` / `catalogs`，由 `src/lib/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Stone → Design → Carve / Impression，另有 Stone → Catalog，固定 id 如 `stone_01`、`design_0101`、`carve_010101`），播种幂等，保证每个页面打开都有内容。
-- **localStorage**：仅存元数据 —— `gbsealcarve:db-version`（本地结构版本）、`gbsealcarve:last-backup-at`（最近导出时间）、`gbsealcarve:ui-prefs`（当前印石 / 印稿）。
-- **备份**：`/catalog` 页可导出 JSON（5 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性，覆盖导入前二次确认；另有印谱清单 TXT 与钤印台账 CSV。
+- **IndexedDB（Dexie，数据库名 `gbsealcarve`）**：5 张业务表 `stones` / `designs` / `carves` / `impressions` / `catalogs`，由 `src/lib/utils/db.ts` 统一定义 schema、版本号与升级迁移；另有 v3 起的 `kvmeta` 键值表（活动批次基线 `active-batch`、已应用批次 `applied-batches`、导入回滚点 `rollback-snapshot`）。`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Stone → Design → Carve / Impression，另有 Stone → Catalog，固定 id 如 `stone_01`、`design_0101`、`carve_010101`），播种幂等，保证每个页面打开都有内容。旧库升级 v3 时自动补批次与撤回标记，首次启动 `ensureActiveBatch()` 以当前全量建立批次基线。
+- **localStorage**：存元数据 —— `gbsealcarve:db-version`（本地结构版本）、`gbsealcarve:last-backup-at`（最近导出时间）、`gbsealcarve:ui-prefs`（当前印石 / 印稿）、`gbsealcarve:machine-id` / `machine-name`（本机身份）、`gbsealcarve:data-rev`（跨标签页写通知）。
+- **备份**：`/catalog` 页可导出整库 JSON（5 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性，旧版备份自动迁移，覆盖导入前留存回滚点；另有印谱清单 TXT 与钤印台账 CSV。**多机增量合并请用 `/handoff` 的离线交接包**（`kind: "handoff"`，含本批改动行与基线）。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---

@@ -12,6 +12,7 @@ import {
   type PaperKind,
 } from '$lib/types/impression';
 import { adoptDesign, designById, updateDesign } from './designStore';
+import { withdrawRow } from '$lib/utils/handoff';
 
 export interface ImpressionFilters {
   keyword: string;
@@ -58,7 +59,8 @@ export const gradeSortedImpressions = derived(impressions, ($impressions) =>
 export async function loadImpressions(): Promise<void> {
   impressionLoading.set(true);
   try {
-    const rows = await db.impressions.toArray();
+    const all = await db.impressions.toArray();
+    const rows = all.filter((impression) => impression.withdrawn !== true);
     rows.sort((a, b) => b.stampedAt.localeCompare(a.stampedAt));
     impressions.set(rows);
     impressionError.set('');
@@ -113,6 +115,15 @@ export async function updateImpression(id: string, patch: Partial<Impression>): 
 
 export async function removeImpression(id: string): Promise<void> {
   await db.impressions.delete(id);
+  await loadImpressions();
+}
+
+/**
+ * 撤回一条钤印（软删除，离线交接时随批次同步撤回）。
+ * 与「删除」不同：撤回保留行并打 withdrawn 标记，他机导入时同样撤回。
+ */
+export async function withdrawImpression(id: string): Promise<void> {
+  await withdrawRow('impressions', id);
   await loadImpressions();
 }
 

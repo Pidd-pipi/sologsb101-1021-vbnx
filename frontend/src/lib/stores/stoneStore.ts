@@ -59,7 +59,8 @@ export const currentStone = derived([stones, currentStoneId], ([$stones, $id]) =
 export async function loadStones(): Promise<void> {
   stoneLoading.set(true);
   try {
-    const rows = await db.stones.toArray();
+    const all = await db.stones.toArray();
+    const rows = all.filter((stone) => stone.withdrawn !== true);
     rows.sort((a, b) => b.updatedAt - a.updatedAt);
     stones.set(rows);
     stoneError.set('');

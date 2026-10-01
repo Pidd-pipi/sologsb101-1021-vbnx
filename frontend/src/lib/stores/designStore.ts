@@ -52,7 +52,8 @@ export const adoptedDesigns = derived(designs, ($designs) => $designs.filter((de
 export async function loadDesigns(): Promise<void> {
   designLoading.set(true);
   try {
-    const rows = await db.designs.toArray();
+    const all = await db.designs.toArray();
+    const rows = all.filter((design) => design.withdrawn !== true);
     rows.sort((a, b) => b.updatedAt - a.updatedAt);
     designs.set(rows);
     designError.set('');

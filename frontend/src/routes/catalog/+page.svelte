@@ -23,11 +23,12 @@
     DB_NAME,
     DB_VERSION,
     exportSnapshot,
-    importSnapshot,
     readLastBackupAt,
     resetDatabase,
     writeLastBackupAt,
   } from '$lib/utils/db';
+  import { replaceAllWithBackup, restoreRollbackPoint, getRollbackPoint } from '$lib/utils/handoff';
+  import { reloadAllData } from '$lib/stores/syncStore';
   import {
     buildCatalogText,
     copyText,
@@ -178,10 +179,33 @@
       showToast(invalid);
       return;
     }
-    if (!window.confirm('导入会清空当前浏览器中的全部档案，再写入备份内容，操作不可撤销。是否继续？')) return;
-    await importSnapshot(parsed as SealCarveSnapshot);
-    await Promise.all([loadStones(), loadDesigns(), loadCarves(), loadImpressions(), catalogTable.refresh()]);
-    showToast('导入完成，数据已覆盖');
+    const snapshot = parsed as SealCarveSnapshot;
+    const legacyNote = snapshot.schemaVersion < DB_VERSION ? '（旧版数据将自动迁移并补批次、撤回标记）' : '';
+    if (
+      !window.confirm(
+        `导入会清空当前浏览器中的全部档案，再写入备份内容；导入前会自动留存恢复点，失败可恢复。${legacyNote} 是否继续？`,
+      )
+    )
+      return;
+    try {
+      await replaceAllWithBackup(snapshot);
+      await Promise.all([reloadAllData(), catalogTable.refresh()]);
+      showToast(`导入完成，数据已覆盖${legacyNote ? '并迁移' : ''}`);
+    } catch (err) {
+      showToast(`导入失败，已尝试自动恢复：${err instanceof Error ? err.message : '未知错误'}`);
+    }
+  }
+
+  async function handleRestore(): Promise<void> {
+    const point = await getRollbackPoint();
+    if (!point) {
+      showToast('没有可恢复的导入前备份');
+      return;
+    }
+    if (!window.confirm('将放弃最近一次导入后的全部改动，恢复到导入前的备份。是否继续？')) return;
+    const ok = await restoreRollbackPoint();
+    await Promise.all([reloadAllData(), catalogTable.refresh()]);
+    showToast(ok ? '已恢复到导入前状态' : '恢复失败');
   }
 
   async function handleReset(): Promise<void> {
@@ -204,6 +228,7 @@
     <div class="flex flex-wrap gap-2">
       <button class="gb-btn" onclick={() => void handleExport()}>导出 JSON</button>
       <button class="gb-btn" onclick={() => fileInput?.click()}>导入 JSON</button>
+      <button class="gb-btn" onclick={() => void handleRestore()}>恢复导入前</button>
       <button class="gb-btn-danger" onclick={() => void handleReset()}>清空重播种</button>
       <button class="gb-btn-primary" onclick={openCreate}>加入印谱</button>
       <input
@@ -337,7 +362,8 @@
     <section class="gb-panel space-y-3">
       <h3 class="text-base text-ink">整库导出</h3>
       <p class="text-sm text-ink-soft">
-        导出文件包含 5 张业务表全量数据与结构版本号（v{DB_VERSION}），可在其他设备通过「导入 JSON」还原。
+        导出文件包含 5 张业务表全量数据与结构版本号（v{DB_VERSION}）。整库导入为覆盖式（导入前自动留恢复点）；
+        多机外地评审的增量合并请使用顶部导航的「<a class="text-seal underline" href="/handoff">离线交接</a>」。
       </p>
       <div class="flex flex-wrap gap-2">
         <button class="gb-btn" onclick={() => void handleExport()}>JSON 备份</button>

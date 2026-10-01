@@ -27,6 +27,7 @@
     setImpressionKeyword,
     setImpressionPaperTypes,
     updateImpression,
+    withdrawImpression,
   } from '$lib/stores/impressionStore';
   import { currentDesignId, designs, setCurrentDesign } from '$lib/stores/designStore';
   import {
@@ -225,6 +226,17 @@
           <div class="mt-3 flex flex-wrap gap-2">
             {#if isBest}<span class="gb-tag" style="color:#3f6b57;border-color:#3f6b5766">当前最佳</span>{/if}
             <button class="gb-btn" onclick={() => openEdit(impression)}>编辑</button>
+            <button
+              class="gb-btn"
+              title="撤回为软删除，会随离线交接包同步到其他机器"
+              onclick={async () => {
+                if (window.confirm('撤回该钤印记录？撤回为软删除，会随离线交接包同步到其他机器。')) {
+                  await withdrawImpression(impression.id);
+                }
+              }}
+            >
+              撤回
+            </button>
             <button class="gb-btn-danger" onclick={() => (pendingDelete = impression)}>删除</button>
           </div>
         </article>

@@ -27,6 +27,12 @@ export interface Stone {
   purchaseDate: string;
   /** 当前状态 */
   state: StoneState;
+  /** 离线交接：最近所属批次（v3；旧数据迁移为 legacy 批） */
+  batchId?: string;
+  /** 离线交接：撤回标记（软删除，交接时同步撤回） */
+  withdrawn?: boolean;
+  /** 离线交接：撤回时间戳 */
+  withdrawnAt?: number | null;
   createdAt: number;
   updatedAt: number;
 }

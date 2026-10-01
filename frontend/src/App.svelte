@@ -7,11 +7,18 @@
   import { activeNav, NAV_ITEMS, router } from '$lib/router';
   import RouteView from '$lib/router/RouteView.svelte';
   import { initDatabase } from '$lib/utils/db';
+  import { ensureActiveBatch } from '$lib/utils/handoff';
   import { loadStones, stones } from '$lib/stores/stoneStore';
   import { designs, loadDesigns } from '$lib/stores/designStore';
   import { carves, loadCarves } from '$lib/stores/carveStore';
   import { impressions, loadImpressions } from '$lib/stores/impressionStore';
   import { useIdbTable } from '$lib/hooks/useIdbTable';
+  import {
+    initCrossTabSync,
+    refreshAfterRemoteChange,
+    remoteDataChanged,
+    dismissReloadNotice,
+  } from '$lib/stores/syncStore';
   import type { Catalog } from '$lib/types/catalog';
 
   // 印谱条目没有独立 store：App 与 /catalog 页通过 useIdbTable 的 liveQuery 订阅消费
@@ -20,12 +27,25 @@
 
   let ready = $state(false);
   let errorText = $state('');
+  let refreshing = $state(false);
 
   const current = $derived(activeNav(router.location));
+
+  async function handleRefreshRemote(): Promise<void> {
+    refreshing = true;
+    try {
+      await refreshAfterRemoteChange();
+    } finally {
+      refreshing = false;
+    }
+  }
 
   onMount(async () => {
     try {
       await initDatabase();
+      // 旧数据打开后自动迁移（v3 upgrade），并保证存在活动批次（补批次基线）
+      await ensureActiveBatch();
+      initCrossTabSync();
       await Promise.all([loadStones(), loadDesigns(), loadCarves(), loadImpressions()]);
     } catch (error) {
       errorText = error instanceof Error ? error.message : '本地数据库初始化失败';
@@ -36,6 +56,19 @@
 </script>
 
 <div class="relative z-10 flex min-h-screen flex-col">
+  {#if $remoteDataChanged}
+    <div class="border-b border-amber/50 bg-amber/15 px-6 py-2 text-sm text-ink">
+      <div class="mx-auto flex max-w-[1360px] flex-wrap items-center justify-between gap-2">
+        <span>另一个标签页已保存数据，为避免覆盖，请先刷新本页视图。</span>
+        <span class="flex gap-2">
+          <button class="gb-btn px-2 py-0.5 text-xs" onclick={dismissReloadNotice} disabled={refreshing}>稍后</button>
+          <button class="gb-btn-primary px-2 py-0.5 text-xs" onclick={() => void handleRefreshRemote()} disabled={refreshing}>
+            {refreshing ? '刷新中…' : '立即刷新'}
+          </button>
+        </span>
+      </div>
+    </div>
+  {/if}
   <header class="border-b border-line bg-paper-light/95 backdrop-blur">
     <div class="mx-auto flex max-w-[1360px] flex-wrap items-center justify-between gap-4 px-6 py-3">
       <div class="flex items-center gap-3">

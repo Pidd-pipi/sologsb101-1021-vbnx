@@ -39,7 +39,8 @@ export const carveTotals = derived(carves, ($carves) => {
 export async function loadCarves(): Promise<void> {
   carveLoading.set(true);
   try {
-    const rows = await db.carves.toArray();
+    const all = await db.carves.toArray();
+    const rows = all.filter((carve) => carve.withdrawn !== true);
     rows.sort((a, b) => (a.designId === b.designId ? a.seq - b.seq : a.designId.localeCompare(b.designId)));
     carves.set(rows);
     carveError.set('');

@@ -23,6 +23,12 @@ export interface Carve {
   operator: string;
   /** 工序状态 */
   state: CarveState;
+  /** 离线交接：最近所属批次（v3） */
+  batchId?: string;
+  /** 离线交接：撤回标记（软删除） */
+  withdrawn?: boolean;
+  /** 离线交接：撤回时间戳 */
+  withdrawnAt?: number | null;
   createdAt: number;
   updatedAt: number;
 }

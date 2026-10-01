@@ -1,7 +1,8 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据结构版本号与升级迁移逻辑（v1 初版；v2 为 impressions 增加 grade 索引、
- *   为 catalogs 增加 orderNo 索引，并回填历史记录缺失字段）
+ * - 数据结构版本号与升级迁移逻辑（v1 初版；v2 补充索引与字段回填；
+ *   v3 增加离线交接：五表同步字段 batchId/withdrawn/withdrawnAt 索引与
+ *   kvmeta 键值表（批次基线、已应用批次、导入回滚点），旧数据自动补批次与撤回标记）
  * - 五张业务表的增删改查与整库导入导出
  * - 首次打开自动播种三层互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
@@ -12,12 +13,13 @@ import type { Design } from '$lib/types/design';
 import type { Carve } from '$lib/types/carve';
 import type { Impression } from '$lib/types/impression';
 import type { Catalog } from '$lib/types/catalog';
+import { IMPORTED_BATCH_ID, LEGACY_BATCH_ID, normalizeSyncRow, type SyncRow } from './sync';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbsealcarve';
 
 /** 当前数据结构版本号 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -79,12 +81,51 @@ export function writeLastBackupAt(value: string): void {
   }
 }
 
+/** kvmeta 键值表（v3）：离线交接批次基线、已应用批次、导入回滚点等元数据 */
+export interface KvMeta {
+  /** 元数据键，见 META_KEYS */
+  key: string;
+  value: unknown;
+  updatedAt: number;
+}
+
+/** kvmeta 固定键 */
+export const META_KEYS = {
+  activeBatch: 'active-batch',
+  appliedBatches: 'applied-batches',
+  rollback: 'rollback-snapshot',
+} as const;
+
+/** 业务表名（与 sync.ts TABLE_NAMES 对应） */
+export const BUSINESS_TABLES = ['stones', 'designs', 'carves', 'impressions', 'catalogs'] as const;
+
+/**
+ * 跨标签页写通知钩子：本标签页任何业务表写操作提交后回调（微任务去抖）。
+ * 由 syncStore 注册，通过 BroadcastChannel / storage 事件通知其它标签页提示刷新。
+ */
+let localWriteCallback: (() => void) | null = null;
+let writeScheduled = false;
+
+export function onLocalDataWrite(callback: () => void): void {
+  localWriteCallback = callback;
+}
+
+function scheduleLocalWriteNotice(): void {
+  if (writeScheduled || !localWriteCallback) return;
+  writeScheduled = true;
+  queueMicrotask(() => {
+    writeScheduled = false;
+    localWriteCallback?.();
+  });
+}
+
 class SealCarveDatabase extends Dexie {
   stones!: Table<Stone, string>;
   designs!: Table<Design, string>;
   carves!: Table<Carve, string>;
   impressions!: Table<Impression, string>;
   catalogs!: Table<Catalog, string>;
+  kvmeta!: Table<KvMeta, string>;
 
   constructor() {
     super(DB_NAME);
@@ -99,7 +140,7 @@ class SealCarveDatabase extends Dexie {
     });
 
     // v2：补充检索索引并回填历史记录缺失字段
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stones: 'id, name, stoneType, knobStyle, state, purchaseDate, updatedAt',
         designs: 'id, stoneId, style, borderStyle, adopted, updatedAt',
@@ -131,6 +172,38 @@ class SealCarveDatabase extends Dexie {
             if (!catalog.included) catalog.included = 'pending';
           });
       });
+
+    // v3：离线交接同步字段索引 + kvmeta 元数据表
+    // 旧数据自动补批次（legacy）与撤回标记（withdrawn=false）
+    this.version(DB_VERSION)
+      .stores({
+        stones: 'id, name, stoneType, knobStyle, state, purchaseDate, batchId, withdrawn, updatedAt',
+        designs: 'id, stoneId, style, borderStyle, adopted, batchId, withdrawn, updatedAt',
+        carves: 'id, designId, seq, knifeMethod, operator, state, batchId, withdrawn, updatedAt',
+        impressions: 'id, designId, grade, paperType, stampedAt, batchId, withdrawn, updatedAt',
+        catalogs: 'id, stoneId, designId, orderNo, included, batchId, withdrawn, updatedAt',
+        kvmeta: 'key',
+      })
+      .upgrade(async (tx) => {
+        for (const tableName of BUSINESS_TABLES) {
+          await tx
+            .table<SyncRow>(tableName)
+            .toCollection()
+            .modify((row) => {
+              const normalized = normalizeSyncRow(row, LEGACY_BATCH_ID);
+              row.batchId = normalized.batchId;
+              row.withdrawn = normalized.withdrawn;
+              row.withdrawnAt = normalized.withdrawnAt;
+            });
+        }
+      });
+
+    // 跨标签页：本标签页业务表写操作（creating/updating/deleting）后通知其它标签页
+    for (const tableName of BUSINESS_TABLES) {
+      this.table(tableName).hook('creating', () => scheduleLocalWriteNotice());
+      this.table(tableName).hook('updating', () => scheduleLocalWriteNotice());
+      this.table(tableName).hook('deleting', () => scheduleLocalWriteNotice());
+    }
   }
 }
 
@@ -142,13 +215,43 @@ export function createId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}${rand}`;
 }
 
-/** 打开数据库并在首次使用时播种演示数据（幂等） */
+/** 打开数据库并在首次使用时播种演示数据（幂等）；旧数据自动补批次与撤回标记 */
 export async function initDatabase(): Promise<void> {
   await db.open();
   stampDbVersion();
   if ((await db.stones.count()) === 0) {
     await seedDatabase();
   }
+  await normalizeUnsyncedRows();
+}
+
+/** 安全网：给遗漏同步字段的行（如旧库直写、早期播种数据）补批次与撤回标记 */
+export async function normalizeUnsyncedRows(fallbackBatchId: string = LEGACY_BATCH_ID): Promise<void> {
+  await db.transaction('rw', BUSINESS_TABLES.map((name) => db.table(name)), async () => {
+    for (const tableName of BUSINESS_TABLES) {
+      const table = db.table<SyncRow, string>(tableName);
+      const rows = await table.toArray();
+      const fixed = rows
+        .filter((row) => typeof row.batchId !== 'string' || row.batchId.length === 0 || typeof row.withdrawn !== 'boolean')
+        .map((row) => normalizeSyncRow(row, fallbackBatchId));
+      if (fixed.length > 0) await table.bulkPut(fixed);
+    }
+  });
+}
+
+/* ------------------------------ kvmeta 键值表 ------------------------------ */
+
+export async function getMeta<T>(key: string): Promise<T | undefined> {
+  const row = await db.kvmeta.get(key);
+  return row?.value as T | undefined;
+}
+
+export async function setMeta(key: string, value: unknown): Promise<void> {
+  await db.kvmeta.put({ key, value, updatedAt: Date.now() });
+}
+
+export async function deleteMeta(key: string): Promise<void> {
+  await db.kvmeta.delete(key);
 }
 
 /* ------------------------------ 播种数据 ------------------------------ */
@@ -283,16 +386,41 @@ export async function exportSnapshot(): Promise<SealCarveSnapshot> {
   };
 }
 
-/** 校验导入文件结构，返回错误文案（空串表示通过） */
+/** 校验导入文件结构，返回错误文案（空串表示通过）；交接包请走 validateHandoff */
 export function validateSnapshot(input: unknown): string {
   if (typeof input !== 'object' || input === null) return '文件内容不是合法的 JSON 对象';
   const snapshot = input as Partial<SealCarveSnapshot>;
   if (snapshot.app !== DB_NAME) return `备份文件不属于本项目（app=${String(snapshot.app)}）`;
+  if ((snapshot as { kind?: string }).kind === 'handoff') {
+    return '该文件是离线交接包，请在「离线交接」页导入合并';
+  }
   const keys: Array<keyof SealCarveSnapshot> = ['stones', 'designs', 'carves', 'impressions', 'catalogs'];
   for (const key of keys) {
     if (!Array.isArray(snapshot[key])) return `备份文件缺少 ${String(key)} 集合`;
   }
   return '';
+}
+
+/**
+ * 归一化整库备份：旧版本（v1/v2，无 batchId/withdrawn）备份打开后自动补批次与撤回标记。
+ * 不写库，仅返回规整后的行集合。
+ */
+export function normalizeSnapshot(snapshot: SealCarveSnapshot): {
+  stones: Stone[];
+  designs: Design[];
+  carves: Carve[];
+  impressions: Impression[];
+  catalogs: Catalog[];
+} {
+  const legacy = snapshot.schemaVersion < DB_VERSION;
+  const fallback = legacy ? IMPORTED_BATCH_ID : LEGACY_BATCH_ID;
+  return {
+    stones: (snapshot.stones ?? []).map((row) => normalizeSyncRow(row, fallback)),
+    designs: (snapshot.designs ?? []).map((row) => normalizeSyncRow(row, fallback)),
+    carves: (snapshot.carves ?? []).map((row) => normalizeSyncRow(row, fallback)),
+    impressions: (snapshot.impressions ?? []).map((row) => normalizeSyncRow(row, fallback)),
+    catalogs: (snapshot.catalogs ?? []).map((row) => normalizeSyncRow(row, fallback)),
+  };
 }
 
 export async function clearAllTables(): Promise<void> {
@@ -307,14 +435,26 @@ export async function clearAllTables(): Promise<void> {
   });
 }
 
+/**
+ * 整库覆盖导入（单事务，失败整体回滚）。
+ * 旧版本备份自动迁移：补批次标记与撤回标记。
+ * 注意：调用方（handoff.replaceAllWithBackup）负责导入前的回滚点备份。
+ */
 export async function importSnapshot(snapshot: SealCarveSnapshot): Promise<void> {
-  await clearAllTables();
+  const normalized = normalizeSnapshot(snapshot);
   await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs], async () => {
-    await db.stones.bulkPut(snapshot.stones);
-    await db.designs.bulkPut(snapshot.designs);
-    await db.carves.bulkPut(snapshot.carves);
-    await db.impressions.bulkPut(snapshot.impressions);
-    await db.catalogs.bulkPut(snapshot.catalogs);
+    await Promise.all([
+      db.stones.clear(),
+      db.designs.clear(),
+      db.carves.clear(),
+      db.impressions.clear(),
+      db.catalogs.clear(),
+    ]);
+    await db.stones.bulkPut(normalized.stones);
+    await db.designs.bulkPut(normalized.designs);
+    await db.carves.bulkPut(normalized.carves);
+    await db.impressions.bulkPut(normalized.impressions);
+    await db.catalogs.bulkPut(normalized.catalogs);
   });
 }
 
@@ -362,13 +502,18 @@ export async function removeDesignCascade(designId: string): Promise<void> {
   if (stoneId) await renumberCatalog(stoneId);
 }
 
-/** 印谱条目按序重编号（排序号连续） */
+/**
+ * 印谱条目按序重编号（排序号连续）。
+ * 撤回（软删除）条目不占排序号；离线交接合并完成后无 stoneId 全局重算印谱顺序。
+ */
 export async function renumberCatalog(stoneId?: string): Promise<void> {
   const rows = stoneId
     ? await db.catalogs.where('stoneId').equals(stoneId).toArray()
     : await db.catalogs.toArray();
-  const sorted = [...rows].sort((a, b) =>
+  const active = rows.filter((row) => row.withdrawn !== true);
+  const sorted = [...active].sort((a, b) =>
     a.orderNo === b.orderNo ? a.createdAt - b.createdAt : a.orderNo - b.orderNo,
   );
-  await db.catalogs.bulkPut(sorted.map((row, index) => ({ ...row, orderNo: index + 1, updatedAt: Date.now() })));
+  const now = Date.now();
+  await db.catalogs.bulkPut(sorted.map((row, index) => ({ ...row, orderNo: index + 1, updatedAt: now })));
 }
