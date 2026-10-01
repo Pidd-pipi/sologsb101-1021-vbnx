@@ -3,7 +3,7 @@
  * 维护印稿草稿与采用稿标记；同一印石可存多稿，采用稿唯一。
  */
 import { derived, get, writable } from 'svelte/store';
-import { createId, db, removeDesignCascade } from '$lib/utils/db';
+import { createId, db, removeDesignCascade, withLocalBatch } from '$lib/utils/db';
 import type { BorderStyle, Design, DesignDraft, DesignStyle } from '$lib/types/design';
 import { readUiPrefs, writeUiPrefs } from '$lib/utils/db';
 
@@ -52,7 +52,7 @@ export const adoptedDesigns = derived(designs, ($designs) => $designs.filter((de
 export async function loadDesigns(): Promise<void> {
   designLoading.set(true);
   try {
-    const rows = await db.designs.toArray();
+    const rows = (await db.designs.toArray()).filter((design) => !design.withdrawn);
     rows.sort((a, b) => b.updatedAt - a.updatedAt);
     designs.set(rows);
     designError.set('');
@@ -106,7 +106,7 @@ export function resetDesignFilters(): void {
 
 export async function createDesign(draft: DesignDraft): Promise<Design> {
   const now = Date.now();
-  const row: Design = { ...draft, id: createId('design'), createdAt: now, updatedAt: now };
+  const row: Design = withLocalBatch({ ...draft, id: createId('design'), createdAt: now, updatedAt: now });
   await db.designs.put(row);
   // 采用稿唯一：新稿标记采用时清除同石其它采用稿
   if (row.adopted) await clearOtherAdopted(row.stoneId, row.id);

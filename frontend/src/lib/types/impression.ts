@@ -28,6 +28,10 @@ export interface Impression {
   stampedAt: string;
   /** 备注（是否采用稿效果等） */
   note: string;
+  /** 最近触碰批次 id */
+  batchId?: string;
+  /** 软删除标记（撤回） */
+  withdrawn?: boolean;
   createdAt: number;
   updatedAt: number;
 }

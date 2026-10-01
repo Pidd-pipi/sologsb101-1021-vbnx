@@ -12,11 +12,13 @@
   import { carves, loadCarves } from '$lib/stores/carveStore';
   import { impressions, loadImpressions } from '$lib/stores/impressionStore';
   import { useIdbTable } from '$lib/hooks/useIdbTable';
+  import { useTabGuard } from '$lib/hooks/useTabGuard';
   import type { Catalog } from '$lib/types/catalog';
 
   // 印谱条目没有独立 store：App 与 /catalog 页通过 useIdbTable 的 liveQuery 订阅消费
   const catalogTable = useIdbTable<Catalog>((database) => database.catalogs, { sortByUpdatedAt: false });
   const catalogRows = catalogTable.rows;
+  const { externalWrite, externalLease } = useTabGuard();
 
   let ready = $state(false);
   let errorText = $state('');
@@ -33,6 +35,10 @@
       ready = true;
     }
   });
+
+  function refreshPage(): void {
+    window.location.reload();
+  }
 </script>
 
 <div class="relative z-10 flex min-h-screen flex-col">
@@ -64,6 +70,16 @@
   </header>
 
   <main class="mx-auto w-full max-w-[1360px] flex-1 px-6 py-5">
+    {#if $externalWrite}
+      <div class="mb-4 rounded-xl border border-seal/40 bg-seal/10 px-4 py-3 text-sm text-seal">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <span>
+            检测到其他标签页已保存数据（{$externalLease?.reason ?? '写入'}），为避免覆盖，请先刷新本页再继续操作。
+          </span>
+          <button class="gb-btn-primary" onclick={refreshPage}>刷新页面</button>
+        </div>
+      </div>
+    {/if}
     {#if errorText}
       <div class="mb-4 rounded-xl border border-seal/40 bg-seal/10 px-4 py-3 text-sm text-seal">
         本地数据库初始化失败：{errorText}

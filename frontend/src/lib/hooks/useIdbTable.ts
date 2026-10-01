@@ -8,7 +8,7 @@ import { onDestroy } from 'svelte';
 import { writable, type Readable } from 'svelte/store';
 import { createId, db } from '$lib/utils/db';
 
-export type IdbRecord = { id: string; createdAt?: number; updatedAt?: number };
+export type IdbRecord = { id: string; createdAt?: number; updatedAt?: number; withdrawn?: boolean };
 
 export type NewRecord<T extends IdbRecord> = Omit<T, 'id' | 'createdAt' | 'updatedAt'> & {
   id?: string;
@@ -54,7 +54,9 @@ export function useIdbTable<T extends IdbRecord>(
   const error = writable('');
 
   const applySort = (list: T[]): T[] =>
-    sortByUpdatedAt ? [...list].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)) : [...list];
+    list
+      .filter((row) => !row.withdrawn)
+      .sort((a, b) => (sortByUpdatedAt ? (b.updatedAt ?? 0) - (a.updatedAt ?? 0) : 0));
 
   const refresh = async (): Promise<void> => {
     loading.set(true);

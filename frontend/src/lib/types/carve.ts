@@ -23,6 +23,10 @@ export interface Carve {
   operator: string;
   /** 工序状态 */
   state: CarveState;
+  /** 最近触碰批次 id */
+  batchId?: string;
+  /** 软删除标记（撤回） */
+  withdrawn?: boolean;
   createdAt: number;
   updatedAt: number;
 }

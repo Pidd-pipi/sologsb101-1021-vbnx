@@ -72,6 +72,7 @@ npm run preview    # 本地预览构建产物（http://localhost:22821）
 | `/#/carve` | 刻制工序看板 | 按印稿列出刀法步骤、拖拽或上下移排序、批量完成；全部完成回写印石为「已刻」 | Carve、Design |
 | `/#/impressions` | 钤印登记与效果比对 | 同稿多枚并列展示印泥、纸张、压力与评级，按评级择优并一键回填采用稿效果 | Impression、Design |
 | `/#/catalog` | 印谱汇总与导出 | 排序重编号、收录状态切换、印谱清单生成、JSON 导入导出与清空重播种 | Catalog 及全部模型 |
+| `/#/handoff` | 离线交接 | 各机一批导出交接包，回社导入先预览新增 / 修改 / 撤回 / 冲突，确认后一起生效；印石冲突字段级裁决，工序两边保留并重排，钤印按日期+纸张去重，生效后重算印谱顺序；导入失败可还原，多标签页保存提示刷新 | 全部模型 + Batch |
 
 未知路径由 `routes/NotFound.svelte` 给出友好空态（不白屏）。筛选条件写入 hash query（`?kw=&stoneType=&knobStyle=` 等），刷新后可完整还原。
 
@@ -87,7 +88,9 @@ npm run preview    # 本地预览构建产物（http://localhost:22821）
 | Impression 钤印记录 | `src/lib/types/impression.ts` | `id` `designId` `inkBrand` `paperType`（连史纸/宣纸/罗纹纸） `pressure`（轻/中/重） `grade`（优/良/一般/废） `stampedAt` | 同稿多次钤印按评级排序择优，可一键回填采用稿效果 |
 | Catalog 印谱条目 | `src/lib/types/catalog.ts` | `id` `stoneId` `designId` `orderNo` `included`（待收录/已收录/不收录） `note` | 调整排序后自动重编号并汇总已收录方数 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/lib/utils/db.ts`，当前为 `v2`：`v1` 为初版五表结构；`v2` 补充 `stones.purchaseDate`、`designs.borderStyle`、`carves.operator`、`impressions.paperType`、`catalogs.included` 等索引，并在 Dexie `.upgrade()` 中回填历史记录缺失字段（`grade`、`adopted`、`borderStyle`、`orderNo`、`included`、`note`）。
+数据结构版本号 `DB_VERSION` 定义在 `src/lib/utils/db.ts`，当前为 `v3`：`v1` 为初版五表结构；`v2` 补充 `stones.purchaseDate`、`designs.borderStyle`、`carves.operator`、`impressions.paperType`、`catalogs.included` 等索引并回填历史记录缺失字段；`v3` 为全部业务记录补 `batchId`（最近触碰批次）与 `withdrawn`（软删除 / 撤回）标记，并新增 `batches` 批次留档表，旧数据打开后自动迁移补批次和撤回标记。
+
+**离线交接**：`/handoff` 页各机一批导出交接包（五表全量含撤回记录 + 批次元信息 + 基线快照），回社导入时按「基线 / 本地 / 包内」三区合并，先列出新增、修改、撤回、冲突四类变更，确认后一起生效。冲突按实体类型裁决：印石 / 印稿逐字段选择保留本地或包内；同一印稿两边都改过工序时保留两边记录并按刀法时长重排序；钤印按「印稿 + 钤印日期 + 纸张」去重取较优评级；生效后重算印谱顺序。生效前自动保存还原点，失败自动回滚，可随时撤销恢复；另一个标签页保存数据时本页提示先刷新，避免晚保存覆盖。
 
 ---
 
@@ -98,14 +101,15 @@ sologsb101-1021/
 ├── frontend/                     # 前端源码
 │   ├── src/
 │   │   ├── lib/
-│   │   │   ├── types/            # stone.ts design.ts carve.ts impression.ts catalog.ts
-│   │   │   ├── stores/           # stoneStore.ts designStore.ts carveStore.ts impressionStore.ts
+│   │   │   ├── types/            # stone.ts design.ts carve.ts impression.ts catalog.ts batch.ts
+│   │   │   ├── stores/           # stoneStore.ts designStore.ts carveStore.ts impressionStore.ts handoffStore.ts
 │   │   │   ├── components/common/# GradeTag.svelte FilterBar.svelte StatBadge.svelte EmptyPanel.svelte
-│   │   │   ├── hooks/            # useCarveProgress.ts useIdbTable.ts
-│   │   │   ├── utils/            # stone.ts db.ts export.ts
+│   │   │   ├── components/handoff/# MergePreview.svelte ConflictAdjudicator.svelte
+│   │   │   ├── hooks/            # useCarveProgress.ts useIdbTable.ts useTabGuard.ts
+│   │   │   ├── utils/            # stone.ts db.ts export.ts handoff.ts tabGuard.ts
 │   │   │   └── router/           # index.ts（路由表 + 导航项）
 │   │   ├── routes/               # stones/+page.svelte designs/+page.svelte carve/+page.svelte
-│   │   │                         # impressions/+page.svelte catalog/+page.svelte NotFound.svelte
+│   │   │                         # impressions/+page.svelte catalog/+page.svelte handoff/+page.svelte NotFound.svelte
 │   │   ├── App.svelte            # 应用外壳（导航 + 首屏初始化）
 │   │   ├── main.js main.ts       # 入口：main.js 引用 main.ts 的 bootstrap()
 │   │   └── app.css               # Tailwind 入口 + 基础层 / 组件层

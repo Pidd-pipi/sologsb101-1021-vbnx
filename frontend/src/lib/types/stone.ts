@@ -27,6 +27,10 @@ export interface Stone {
   purchaseDate: string;
   /** 当前状态 */
   state: StoneState;
+  /** 最近触碰批次 id（本地编辑 / 迁移 / 交接批次） */
+  batchId?: string;
+  /** 软删除标记（撤回） */
+  withdrawn?: boolean;
   createdAt: number;
   updatedAt: number;
 }

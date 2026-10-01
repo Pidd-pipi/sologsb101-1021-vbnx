@@ -3,7 +3,7 @@
  * 维护印石列表、当前选中印石与筛选条件；跨页状态不留在组件内部。
  */
 import { derived, get, writable } from 'svelte/store';
-import { createId, db, readUiPrefs, removeStoneCascade, writeUiPrefs } from '$lib/utils/db';
+import { createId, db, readUiPrefs, removeStoneCascade, withLocalBatch, writeUiPrefs } from '$lib/utils/db';
 import {
   nextStoneState,
   type KnobStyle,
@@ -59,7 +59,7 @@ export const currentStone = derived([stones, currentStoneId], ([$stones, $id]) =
 export async function loadStones(): Promise<void> {
   stoneLoading.set(true);
   try {
-    const rows = await db.stones.toArray();
+    const rows = (await db.stones.toArray()).filter((stone) => !stone.withdrawn);
     rows.sort((a, b) => b.updatedAt - a.updatedAt);
     stones.set(rows);
     stoneError.set('');
@@ -96,7 +96,7 @@ export function resetStoneFilters(): void {
 
 export async function createStone(draft: StoneDraft): Promise<Stone> {
   const now = Date.now();
-  const row: Stone = { ...draft, id: createId('stone'), createdAt: now, updatedAt: now };
+  const row: Stone = withLocalBatch({ ...draft, id: createId('stone'), createdAt: now, updatedAt: now });
   await db.stones.put(row);
   await loadStones();
   currentStoneId.set(row.id);

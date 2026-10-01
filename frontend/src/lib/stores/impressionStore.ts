@@ -3,7 +3,7 @@
  * 维护钤印记录与评级排序；可一键把最佳效果回填为采用稿效果。
  */
 import { derived, get, writable } from 'svelte/store';
-import { createId, db } from '$lib/utils/db';
+import { createId, db, withLocalBatch } from '$lib/utils/db';
 import {
   GRADE_WEIGHT,
   type Grade,
@@ -58,7 +58,7 @@ export const gradeSortedImpressions = derived(impressions, ($impressions) =>
 export async function loadImpressions(): Promise<void> {
   impressionLoading.set(true);
   try {
-    const rows = await db.impressions.toArray();
+    const rows = (await db.impressions.toArray()).filter((impression) => !impression.withdrawn);
     rows.sort((a, b) => b.stampedAt.localeCompare(a.stampedAt));
     impressions.set(rows);
     impressionError.set('');
@@ -100,7 +100,7 @@ export function resetImpressionFilters(): void {
 
 export async function createImpression(draft: ImpressionDraft): Promise<Impression> {
   const now = Date.now();
-  const row: Impression = { ...draft, id: createId('impr'), createdAt: now, updatedAt: now };
+  const row: Impression = withLocalBatch({ ...draft, id: createId('impr'), createdAt: now, updatedAt: now });
   await db.impressions.put(row);
   await loadImpressions();
   return row;

@@ -3,7 +3,7 @@
  * 维护工序顺序与完成计数；全部完成即回写印稿为已刻（印石状态置为「已刻」）。
  */
 import { derived, get, writable } from 'svelte/store';
-import { createId, db } from '$lib/utils/db';
+import { createId, db, withLocalBatch } from '$lib/utils/db';
 import {
   nextCarveState,
   suggestMinutes,
@@ -39,7 +39,7 @@ export const carveTotals = derived(carves, ($carves) => {
 export async function loadCarves(): Promise<void> {
   carveLoading.set(true);
   try {
-    const rows = await db.carves.toArray();
+    const rows = (await db.carves.toArray()).filter((carve) => !carve.withdrawn);
     rows.sort((a, b) => (a.designId === b.designId ? a.seq - b.seq : a.designId.localeCompare(b.designId)));
     carves.set(rows);
     carveError.set('');
@@ -65,7 +65,7 @@ export function nextSeq(designId: string): number {
 
 export async function createCarve(draft: CarveDraft): Promise<Carve> {
   const now = Date.now();
-  const row: Carve = { ...draft, id: createId('carve'), createdAt: now, updatedAt: now };
+  const row: Carve = withLocalBatch({ ...draft, id: createId('carve'), createdAt: now, updatedAt: now });
   await db.carves.put(row);
   await loadCarves();
   return row;
@@ -144,17 +144,19 @@ export async function generateStandardSequence(designId: string): Promise<number
     const seq = index + 1;
     if (existing.some((carve) => carve.seq === seq)) continue;
     const method = STANDARD_KNIFE_SEQUENCE[index] as KnifeMethod;
-    await db.carves.put({
-      id: createId('carve'),
-      designId,
-      seq,
-      knifeMethod: method,
-      minutes: suggestMinutes(method),
-      operator: '',
-      state: 'todo',
-      createdAt: now,
-      updatedAt: now,
-    });
+    await db.carves.put(
+      withLocalBatch({
+        id: createId('carve'),
+        designId,
+        seq,
+        knifeMethod: method,
+        minutes: suggestMinutes(method),
+        operator: '',
+        state: 'todo',
+        createdAt: now,
+        updatedAt: now,
+      }),
+    );
     created += 1;
   }
   await loadCarves();

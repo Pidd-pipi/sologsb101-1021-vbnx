@@ -12,19 +12,65 @@ import type { Design } from '$lib/types/design';
 import type { Carve } from '$lib/types/carve';
 import type { Impression } from '$lib/types/impression';
 import type { Catalog } from '$lib/types/catalog';
+import type { BatchRecord, TableName } from '$lib/types/batch';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbsealcarve';
 
 /** 当前数据结构版本号 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
+
+/** v3 迁移批次 id：旧数据补批次标记时统一归入该批次 */
+export const MIGRATION_BATCH_ID = 'migration-v3';
+
+/** 本机批次 id：本地编辑（未导出）统一使用，配合机器 id 区分不同设备 */
+export const LOCAL_BATCH_ID = 'local';
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
   dbVersion: 'gbsealcarve:db-version',
   lastBackupAt: 'gbsealcarve:last-backup-at',
   uiPrefs: 'gbsealcarve:ui-prefs',
+  machineId: 'gbsealcarve:machine-id',
+  baseSnapshot: 'gbsealcarve:base-snapshot',
+  restorePoint: 'gbsealcarve:restore-point',
 } as const;
+
+/** 单表快照（基线 / 还原点用） */
+export type TableSnapshot = unknown[];
+
+export interface BaseSnapshot {
+  exportedAt: string;
+  stones: TableSnapshot;
+  designs: TableSnapshot;
+  carves: TableSnapshot;
+  impressions: TableSnapshot;
+  catalogs: TableSnapshot;
+}
+
+/** 还原点：导入失败或撤销时恢复到导入前 */
+export interface RestorePoint {
+  savedAt: string;
+  reason: string;
+  stones: TableSnapshot;
+  designs: TableSnapshot;
+  carves: TableSnapshot;
+  impressions: TableSnapshot;
+  catalogs: TableSnapshot;
+}
+
+/** 读取（或首次生成）本机稳定机器 id */
+export function getMachineId(): string {
+  try {
+    const existing = localStorage.getItem(LS_KEYS.machineId);
+    if (existing) return existing;
+    const id = `machine_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    localStorage.setItem(LS_KEYS.machineId, id);
+    return id;
+  } catch {
+    return 'machine_unknown';
+  }
+}
 
 export interface UiPrefs {
   lastStoneId: string | null;
@@ -79,12 +125,77 @@ export function writeLastBackupAt(value: string): void {
   }
 }
 
+/* ------------------------- 基线快照（三区合并用） ------------------------- */
+
+const SNAPSHOT_SIZE_LIMIT = 4 * 1024 * 1024;
+
+function readSnapshotKey<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+function writeSnapshotKey(key: string, value: unknown): boolean {
+  try {
+    const text = JSON.stringify(value);
+    if (text.length > SNAPSHOT_SIZE_LIMIT) return false;
+    localStorage.setItem(key, text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 读取基线快照（本机上次同步点） */
+export function readBaseSnapshot(): BaseSnapshot | null {
+  return readSnapshotKey<BaseSnapshot>(LS_KEYS.baseSnapshot);
+}
+
+/** 写入基线快照（合并完成后调用）；数据过大时放弃，退化为时间戳合并 */
+export function writeBaseSnapshot(snapshot: BaseSnapshot): boolean {
+  return writeSnapshotKey(LS_KEYS.baseSnapshot, snapshot);
+}
+
+/** 保存还原点（导入前快照），导入失败或撤销时恢复 */
+export function saveRestorePoint(point: RestorePoint): boolean {
+  return writeSnapshotKey(LS_KEYS.restorePoint, point);
+}
+
+export function readRestorePoint(): RestorePoint | null {
+  return readSnapshotKey<RestorePoint>(LS_KEYS.restorePoint);
+}
+
+export function clearRestorePoint(): void {
+  try {
+    localStorage.removeItem(LS_KEYS.restorePoint);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 把当前五表全量（含撤回记录）序列化为快照对象 */
+export async function captureSnapshot(): Promise<BaseSnapshot> {
+  const [stones, designs, carves, impressions, catalogs] = await Promise.all([
+    db.stones.toArray(),
+    db.designs.toArray(),
+    db.carves.toArray(),
+    db.impressions.toArray(),
+    db.catalogs.toArray(),
+  ]);
+  return { exportedAt: new Date().toISOString(), stones, designs, carves, impressions, catalogs };
+}
+
 class SealCarveDatabase extends Dexie {
   stones!: Table<Stone, string>;
   designs!: Table<Design, string>;
   carves!: Table<Carve, string>;
   impressions!: Table<Impression, string>;
   catalogs!: Table<Catalog, string>;
+  batches!: Table<BatchRecord, string>;
 
   constructor() {
     super(DB_NAME);
@@ -99,7 +210,7 @@ class SealCarveDatabase extends Dexie {
     });
 
     // v2：补充检索索引并回填历史记录缺失字段
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stones: 'id, name, stoneType, knobStyle, state, purchaseDate, updatedAt',
         designs: 'id, stoneId, style, borderStyle, adopted, updatedAt',
@@ -131,6 +242,31 @@ class SealCarveDatabase extends Dexie {
             if (!catalog.included) catalog.included = 'pending';
           });
       });
+
+    // v3：所有业务记录补 batchId / withdrawn 标记；新增 batches 批次留档表
+    this.version(DB_VERSION)
+      .stores({
+        stones: 'id, name, stoneType, knobStyle, state, purchaseDate, batchId, withdrawn, updatedAt',
+        designs: 'id, stoneId, style, borderStyle, adopted, batchId, withdrawn, updatedAt',
+        carves: 'id, designId, seq, knifeMethod, operator, state, batchId, withdrawn, updatedAt',
+        impressions: 'id, designId, grade, paperType, stampedAt, batchId, withdrawn, updatedAt',
+        catalogs: 'id, stoneId, designId, orderNo, included, batchId, withdrawn, updatedAt',
+        batches: 'id, no, machineId, exportedAt, importedAt',
+      })
+      .upgrade(async (tx) => {
+        const tables = ['stones', 'designs', 'carves', 'impressions', 'catalogs'];
+        for (const table of tables) {
+          await tx
+            .table(table)
+            .toCollection()
+            .modify((record: Record<string, unknown>) => {
+              if (typeof record.batchId !== 'string' || record.batchId.length === 0) {
+                record.batchId = MIGRATION_BATCH_ID;
+              }
+              if (typeof record.withdrawn !== 'boolean') record.withdrawn = false;
+            });
+        }
+      });
   }
 }
 
@@ -142,12 +278,40 @@ export function createId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}${rand}`;
 }
 
+/** 本地新建记录补批次标记（未导出前统一记为 LOCAL_BATCH_ID） */
+export function withLocalBatch<T extends object>(row: T): T & { batchId: string; withdrawn: boolean } {
+  return { ...row, batchId: LOCAL_BATCH_ID, withdrawn: false };
+}
+
 /** 打开数据库并在首次使用时播种演示数据（幂等） */
 export async function initDatabase(): Promise<void> {
   await db.open();
   stampDbVersion();
   if ((await db.stones.count()) === 0) {
     await seedDatabase();
+  }
+  // 迁移后首次打开：补批次 / 撤回标记（v3 upgrade 处理旧库；此处兜底新库播种数据）
+  await backfillBatchMarkers();
+  // 补齐基线快照（三区合并的共同祖先）
+  if (!readBaseSnapshot()) {
+    const snapshot = await captureSnapshot();
+    writeBaseSnapshot(snapshot);
+  }
+}
+
+/** 为缺少 batchId / withdrawn 的记录补默认标记（幂等） */
+async function backfillBatchMarkers(): Promise<void> {
+  const tables = ['stones', 'designs', 'carves', 'impressions', 'catalogs'] as const;
+  for (const table of tables) {
+    await db
+      .table(table)
+      .toCollection()
+      .modify((record: Record<string, unknown>) => {
+        if (typeof record.batchId !== 'string' || record.batchId.length === 0) {
+          record.batchId = MIGRATION_BATCH_ID;
+        }
+        if (typeof record.withdrawn !== 'boolean') record.withdrawn = false;
+      });
   }
 }
 
@@ -271,16 +435,35 @@ export async function exportSnapshot(): Promise<SealCarveSnapshot> {
     db.impressions.toArray(),
     db.catalogs.toArray(),
   ]);
+  const visible = <T extends { withdrawn?: boolean }>(rows: T[]): T[] => rows.filter((row) => !row.withdrawn);
   return {
     app: DB_NAME,
     schemaVersion: DB_VERSION,
     exportedAt: new Date().toISOString(),
-    stones,
-    designs,
-    carves,
-    impressions,
-    catalogs,
+    stones: visible(stones),
+    designs: visible(designs),
+    carves: visible(carves),
+    impressions: visible(impressions),
+    catalogs: visible(catalogs),
   };
+}
+
+/** 交接包导出：五表全量（含撤回记录，以便把删除操作传播到其他机器） */
+export async function exportHandoffTables(): Promise<{
+  stones: Stone[];
+  designs: Design[];
+  carves: Carve[];
+  impressions: Impression[];
+  catalogs: Catalog[];
+}> {
+  const [stones, designs, carves, impressions, catalogs] = await Promise.all([
+    db.stones.toArray(),
+    db.designs.toArray(),
+    db.carves.toArray(),
+    db.impressions.toArray(),
+    db.catalogs.toArray(),
+  ]);
+  return { stones, designs, carves, impressions, catalogs };
 }
 
 /** 校验导入文件结构，返回错误文案（空串表示通过） */
@@ -334,40 +517,72 @@ export async function countAll(): Promise<Record<string, number>> {
   return { stones, designs, carves, impressions, catalogs };
 }
 
-/** 级联删除印石 → 印稿 → 工序 / 钤印 / 印谱条目 */
+/** 级联撤回印石 → 印稿 → 工序 / 钤印 / 印谱条目（软删除，标记 withdrawn 以便交接传播） */
 export async function removeStoneCascade(stoneId: string): Promise<void> {
-  const designIds = (await db.designs.where('stoneId').equals(stoneId).toArray()).map((row) => row.id);
+  const now = Date.now();
+  const designs = await db.designs.where('stoneId').equals(stoneId).toArray();
+  const designIds = designs.map((row) => row.id);
   await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs], async () => {
     if (designIds.length > 0) {
-      await db.carves.where('designId').anyOf(designIds).delete();
-      await db.impressions.where('designId').anyOf(designIds).delete();
-      await db.catalogs.where('designId').anyOf(designIds).delete();
+      const [carves, impressions, catalogs] = await Promise.all([
+        db.carves.where('designId').anyOf(designIds).toArray(),
+        db.impressions.where('designId').anyOf(designIds).toArray(),
+        db.catalogs.where('designId').anyOf(designIds).toArray(),
+      ]);
+      await Promise.all([
+        db.carves.bulkPut(carves.map((row) => ({ ...row, withdrawn: true, updatedAt: now }))),
+        db.impressions.bulkPut(impressions.map((row) => ({ ...row, withdrawn: true, updatedAt: now }))),
+        db.catalogs.bulkPut(catalogs.map((row) => ({ ...row, withdrawn: true, updatedAt: now }))),
+      ]);
     }
-    await db.designs.where('stoneId').equals(stoneId).delete();
-    await db.catalogs.where('stoneId').equals(stoneId).delete();
-    await db.stones.delete(stoneId);
+    await Promise.all([
+      db.designs.bulkPut(designs.map((row) => ({ ...row, withdrawn: true, updatedAt: now }))),
+      db.catalogs
+        .where('stoneId')
+        .equals(stoneId)
+        .toArray()
+        .then((rows) =>
+          db.catalogs.bulkPut(rows.map((row) => ({ ...row, withdrawn: true, updatedAt: now }))),
+        ),
+      db.stones.update(stoneId, { withdrawn: true, updatedAt: now } as never),
+    ]);
   });
 }
 
-/** 级联删除印稿 → 工序 / 钤印 / 印谱条目，并重编号印谱 */
+/** 级联撤回印稿 → 工序 / 钤印 / 印谱条目，并重编号印谱（软删除） */
 export async function removeDesignCascade(designId: string): Promise<void> {
+  const now = Date.now();
   const catalog = await db.catalogs.where('designId').equals(designId).toArray();
   const stoneId = catalog[0]?.stoneId;
   await db.transaction('rw', [db.designs, db.carves, db.impressions, db.catalogs], async () => {
-    await db.carves.where('designId').equals(designId).delete();
-    await db.impressions.where('designId').equals(designId).delete();
-    await db.catalogs.where('designId').equals(designId).delete();
-    await db.designs.delete(designId);
+    const [carves, impressions, catalogs] = await Promise.all([
+      db.carves.where('designId').equals(designId).toArray(),
+      db.impressions.where('designId').equals(designId).toArray(),
+      db.catalogs.where('designId').equals(designId).toArray(),
+    ]);
+    await Promise.all([
+      db.carves.bulkPut(carves.map((row) => ({ ...row, withdrawn: true, updatedAt: now }))),
+      db.impressions.bulkPut(impressions.map((row) => ({ ...row, withdrawn: true, updatedAt: now }))),
+      db.catalogs.bulkPut(catalogs.map((row) => ({ ...row, withdrawn: true, updatedAt: now }))),
+      db.designs.update(designId, { withdrawn: true, updatedAt: now } as never),
+    ]);
   });
   if (stoneId) await renumberCatalog(stoneId);
 }
 
-/** 印谱条目按序重编号（排序号连续） */
+/** 撤回单条记录（软删除） */
+export async function markRecordWithdrawn(table: TableName, id: string): Promise<void> {
+  const now = Date.now();
+  await db.table(table).update(id, { withdrawn: true, updatedAt: now } as never);
+}
+
+/** 印谱条目按序重编号（排序号连续，仅未撤回条目参与） */
 export async function renumberCatalog(stoneId?: string): Promise<void> {
   const rows = stoneId
     ? await db.catalogs.where('stoneId').equals(stoneId).toArray()
     : await db.catalogs.toArray();
-  const sorted = [...rows].sort((a, b) =>
+  const active = rows.filter((row) => !row.withdrawn);
+  const sorted = [...active].sort((a, b) =>
     a.orderNo === b.orderNo ? a.createdAt - b.createdAt : a.orderNo - b.orderNo,
   );
   await db.catalogs.bulkPut(sorted.map((row, index) => ({ ...row, orderNo: index + 1, updatedAt: Date.now() })));
